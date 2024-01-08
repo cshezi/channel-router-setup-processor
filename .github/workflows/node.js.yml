@@ -4,12 +4,17 @@
 name: Node.js CI
 on:
   push:
-    branches: [ "ext-gh-ci" ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ "ext-gh-ci" ]
+    branches: [ "main" ]
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      responseAverage: ${{ steps.newman_test.outputs.responseAverage }}
+      responseMin: ${{ steps.newman_test.outputs.responseMin }}
+      responseMax: ${{ steps.newman_test.outputs.responseMax }}
+      responseSd: ${{ steps.newman_test.outputs.responseSd }}
     name: install, build, test
     permissions:
       packages: write
@@ -20,48 +25,63 @@ jobs:
         redis-version: [6]
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ext-gh-ci
       - uses: pnpm/action-setup@v2
         with:
           version: 7
+
       - name: Start Arango
         uses: xinova/arangodb-action@v1
         with:
           arangodb version: 'latest'
-      - name: Create Nats Server
+
+      - name: Setup Arango
+        run: newman run https://raw.githubusercontent.com/frmscoe/postman/indexes/ArangoDB%20Setup.json -e https://raw.githubusercontent.com/frmscoe/postman/indexes/environments/Ekuta-LOCAL.postman_environment.json --timeout-request 10200
+
+      - name: Startup Nats
         uses: onichandame/nats-action@master
         with:
-              port: "4222"
-      - name: Start Redis
+          port: 4222
+
+      - name: Startup Redis
         uses: supercharge/redis-github-action@1.7.0
         with:
           redis-version: ${{ matrix.redis-version }}
+
+      - name: StartUp Nats-Rest Proxy
+        run: docker pull ghcr.io/cshezi/nats-utilities:latest && docker run --network=host -e NODE_ENV='dev' ghcr.io/cshezi/nats-utilities:latest &
+
       - name: Setup Node.js (.npmrc)
         uses: actions/setup-node@v3
         with:
           node-version: 20.x
           registry-url: https://npm.pkg.github.com/
-          # Defaults to the user or organization that owns the workflow file
           scope: '@frmscoe'
+
       - name: Install dependencies
-        run: npm ci
+        run: npm install -g newman && npm install -g newman-reporter-htmlextra && npm ci
         env:
           GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+
       - name: Run unit tests
         run: npm run test
         env:
             NODE_ENV: 'test'
             STARTUP_TYPE: 'nats'
-      - name: Create database
-        run: curl --header "Content-Type:application/json" --request POST --data '{ "name":"networkmap", "options":{"sharding":"flexible", "replicationFactor":3 } }' http://localhost:8529/_api/database
+
+      - name: Processor Build
+        run: npm run build
+
       - name: Processor Start
-        run: timeout 2s bun run start || if [ $? -eq 124 ]; then true; fi
+        run: npm run start &
         env:
           NODE_ENV: 'dev'
           STARTUP_TYPE: 'nats'
           SERVER_URL: 'nats://localhost:4222'
           ACK_POLICY: 'None'
-          PRODUCER_STREAM: 'CRSP'
-          CONSUMER_STREAM: 'TMS'
+          PRODUCER_STREAM: 'temp-rule-sub'
+          CONSUMER_STREAM: 'CRSP'
           STREAM_SUBJECT:
           APM_ACTIVE: false
           APM_LOGGING: false
@@ -74,13 +94,38 @@ jobs:
           DATABASE_USER: 'root'
           DATABASE_PASSWORD:
           DATABASE_NAME: 'networkmap'
-      - name: Comment on PR
-        run: |
-            PR_NUMBER=$(echo $GITHUB_REF | awk 'BEGIN {FS="/"} {print $3}')
-            COMMENT_BODY="Hello! This is a comment on PR #$PR_NUMBER. Thank you for your contribution!"
 
-            curl -X POST \
-              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-              -d "{\"body\":\"$COMMENT_BODY\"}"
+      - name: Test Processor
+        run: newman run https://raw.githubusercontent.com/frmscoe/postman/indexes/NATS_RES_CRSP_TEST.postman_collection.json -e https://raw.githubusercontent.com/frmscoe/postman/indexes/environments/Ekuta-LOCAL.postman_environment.json --timeout-request 10200 -r json --reporter-json-export summary.json
+
+      - name: Extract Specific Field
+        id: newman_test
+        run: |
+          echo "::set-output name=responseAverage::$(jq -r '.run.timings.responseAverage' summary.json)"
+          echo "::set-output name=responseMin::$(jq -r '.run.timings.responseMin' summary.json)"
+          echo "::set-output name=responseMax::$(jq -r '.run.timings.responseMax' summary.json)"
+          echo "::set-output name=responseSd::$(jq -r '.run.timings.responseSd' summary.json)"
+
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: summary.json
+          path: summary.json
+
+
+  output:
+      needs: build
+      runs-on: ubuntu-latest
+      steps:
+      - name: Comment on PR
+
+        run: |
+              COMMENT_BODY="<li> Response Average ${{ needs.build.outputs.responseAverage }}ms ⚠️<br /><li>Response Min ${{ needs.build.outputs.responseMin }}ms <br /><li>Response max ${{ needs.build.outputs.responseMax }}ms <br /><li>Response Stardard dev ${{ needs.build.outputs.responseSd }}ms"
+
+              API_URL="https://api.github.com/repos/${{github.repository}}/issues/${{github.event.number}}/comments"
+              curl -X POST \
+                -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+                -H "Content-Type: application/json" \
+                --data-raw "{\"body\":\"$COMMENT_BODY\"}" \
+                $API_URL
